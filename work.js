@@ -23,7 +23,8 @@ let maxProcessMemoryUsage = 0;
 
 let disConnectTime = new Date().toUTCString();
 
-const socket = io("https://staging-socket.wooffer.io");
+// const socket = io("https://staging-socket.wooffer.io");
+const socket = io("http://localhost:5500");
 
 let serviceEnvironmentConfiguration = {};
 
@@ -216,6 +217,7 @@ function init(token, serviceToken) {
         cpuUsageInterval = 10,
         isCustomLogEnabled = true,
       } = details;
+      console.log("details:::::", details)
       serviceEnvironmentConfiguration = {
         isAPIEnabled,
         isServerActivityLogEnabled,
@@ -266,31 +268,15 @@ function init(token, serviceToken) {
   });
 }
 
-const alert = (message = " ") => {
+const emitAlert = (type, message = " ") => {
   if (isConfigEnabled("isCustomLogEnabled")) {
-    socket.emit("alert", {
-      type: "alert",
-      message,
-    });
-  }
-};
-const success = (message = " ") => {
-  if (isConfigEnabled("isCustomLogEnabled")) {
-    socket.emit("alert", {
-      type: "success",
-      message,
-    });
+    socket.emit("alert", { type, message });
   }
 };
 
-const fail = (message = " ") => {
-  if (isConfigEnabled("isCustomLogEnabled")) {
-    socket.emit("alert", {
-      type: "fail",
-      message,
-    });
-  }
-};
+const alert = (message) => emitAlert("alert", message);
+const success = (message) => emitAlert("success", message);
+const fail = (message) => emitAlert("fail", message);
 
 const requestMonitoring = (req, res, next) => {
   if (isConfigEnabled("isAPIEnabled")) {
