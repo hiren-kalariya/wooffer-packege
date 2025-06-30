@@ -338,7 +338,7 @@ const handleRateLimit = (req) => {
 const requestMonitoring = (req, res, next) => {
   // TODO: does this goes inside or outside of the isConfigEnabled("isAPIEnabled")
   console.log("::::: before handle rate limit");
-  handleRateLimit(req)
+  // handleRateLimit(req)
   if (isConfigEnabled("isAPIEnabled")) {
     // request monitoring
     const requestReceivedTime = new Date();
