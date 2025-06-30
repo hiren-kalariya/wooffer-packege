@@ -278,66 +278,51 @@ const fail = (message) => emitAlert("fail", message);
 
 const getRateLimitConfig = (req) => {
   // endpoint config || global config
-  console.log('::::: inside get rate limit config');
   const serviceEnvironmentId = serviceEnvironmentConfiguration?.serviceEnvironmentId;
-  console.log('::::: serviceEnvironmentId:', serviceEnvironmentId);
   const key = `${serviceEnvironmentId}:${req?.method}:${req?.url}`;
-  console.log('::::: constructed key:', key);
   const endpointConfig = rateLimitConfig?.[key];
-  console.log('::::: endpointConfig:', endpointConfig);
   const conf = {
     ...endpointConfig,
     isRateLimit: globalRateLimitConfig.isRateLimit,
     serviceEnvironmentId,
     ip_key: rateLimitConfig?.ip_key || globalRateLimitConfig.ip_key
   } || globalRateLimitConfig;
-  console.log('::::: final config:', conf);
   return conf;
 };
 
 const isIpBlocked = (ip, serviceEnvironmentId) => {
   return new Promise((resolve) => {
-    console.log('::::: start emitting', ip);
     socket.emit("checkIfIpIsBlocked", { ip, serviceEnvironmentId });
     const handler = (isIpBlocked) => {
-      console.log('::::: inside handler');
-      console.log('::::: isIpBlocked value:', isIpBlocked);
       socket.off("isIpBlockedResponse", handler);
       resolve(isIpBlocked);
     };
     socket.on("isIpBlockedResponse", handler);
-    console.log('::::: handler registered for isIpBlockedResponse');
   });
 };
 
 const handleRateLimit = (req) => {
   // get config
-  console.log("::::: inside handleRateLimit");
   const rateLimitConfig = getRateLimitConfig(req);
-  console.log("::::: rateLimitConfig:", rateLimitConfig);
 
   // check if ip is blocked?
-  console.log("::::: checking if IP is blocked");
   if (!isIpBlocked("some-other-ip", serviceEnvironmentConfiguration.serviceEnvironmentId)) {
-    console.log("::::: Blocked IP detected");
     return 'Blocked ip';
   }
 
   // check if config is present and enabled
   if (rateLimitConfig) {
-    console.log("::::: No config present");
     return 'no config';
   }
 
   if (!rateLimitConfig.isRateLimit) {
-    console.log("::::: Rate limiting is not enabled");
     return true;
   }
 }
 
 const requestMonitoring = (req, res, next) => {
   // TODO: does this goes inside or outside of the isConfigEnabled("isAPIEnabled")
-  console.log("::::: before handle rate limit");
+
   // handleRateLimit(req)
   if (isConfigEnabled("isAPIEnabled")) {
     // request monitoring
