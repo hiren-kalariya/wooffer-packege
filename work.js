@@ -30,6 +30,8 @@ let serviceEnvironmentConfiguration = {};
 let rateLimitConfig = {}
 let globalRateLimitConfig = {}
 
+let rateLimitsCount = {};
+
 const RecordData = (usageData = {}) => {
   if (
     !("CPU" in usageData) ||
@@ -212,7 +214,7 @@ function init(token, serviceToken) {
 
   const joinRoomEvent = () => {
     socket.on("updateServiceEnvironmentInformationForPackage", (details) => {
-      console.log("🚀 ~ socket.on ~ details:", details)
+      console.log("::::: ~ socket.on ~ details:", details)
       serviceEnvironmentConfiguration = {
         serviceEnvironmentId: details.serviceToken || null,
         isAPIEnabled: details.isAPIEnabled || true,
@@ -285,7 +287,7 @@ const getRateLimitConfig = (req) => {
     ...endpointConfig,
     isRateLimit: globalRateLimitConfig.isRateLimit,
     serviceEnvironmentId,
-    ip_key: rateLimitConfig?.ip_key || globalRateLimitConfig.ip_key
+    ipKey: rateLimitConfig?.ipKey || globalRateLimitConfig.ipKey
   } || globalRateLimitConfig;
   return conf;
 };
@@ -302,28 +304,43 @@ const isIpBlocked = (ip, serviceEnvironmentId) => {
 };
 
 const handleRateLimit = (req) => {
-  // get config
-  const rateLimitConfig = getRateLimitConfig(req);
-
-  // check if ip is blocked?
+  // TODO: change this to the real ip
   if (!isIpBlocked("some-other-ip", serviceEnvironmentConfiguration.serviceEnvironmentId)) {
-    return 'Blocked ip';
+    return false;
   }
 
-  // check if config is present and enabled
-  if (rateLimitConfig) {
-    return 'no config';
-  }
-
-  if (!rateLimitConfig.isRateLimit) {
+  const rateLimitConfig = getRateLimitConfig(req);
+  if (!rateLimitConfig || !rateLimitConfig.isRateLimit) {
     return true;
+  }
+
+  const key = `${req?.headers[rateLimitConfig.ipKey]}:${rateLimitConfig.serviceEnvironmentId}:${req?.method}:${req?.url}`;
+  if (rateLimitsCount[key]) {
+    const currentTime = Date.now();
+    if (currentTime - rateLimitsCount[key][0] >= rateLimitConfig.windowMs) {
+      rateLimitsCount[key] = [currentTime];
+      return true;
+    } else {
+      if (rateLimitsCount[key].length >= rateLimitConfig.maxRequests) {
+        return false;
+      } else {
+        rateLimitsCount[key].push(currentTime);
+        return true;
+      }
+    }
+  } else {
+    rateLimitsCount[key] = [Date.now()]
+    return true
   }
 }
 
 const requestMonitoring = (req, res, next) => {
   // TODO: does this goes inside or outside of the isConfigEnabled("isAPIEnabled")
 
-  // handleRateLimit(req)
+  if (!handleRateLimit(req)) {
+    return res.status(429).json({ message: rateLimitConfig.rateLimitExceedErrMsg });
+  }
+
   if (isConfigEnabled("isAPIEnabled")) {
     // request monitoring
     const requestReceivedTime = new Date();
