@@ -28,13 +28,13 @@ const socket = io("http://localhost:5500");
 
 let serviceEnvironmentConfiguration = {};
 let rateLimitConfigMap = {
-  // "<serviceEnvId>:<Method>:<url>": config
+  // "<Method>:<url>": config
 }
 let globalRateLimitConfig = {}
 
 let rateLimitsCount = {
   // remove service env id
-  // "<ip>:<serviceEnvId>:<Method>:<url>": {
+  // "<ip>:<Method>:<url>": {
   //   timestamps: [Date.now()]
   //   exceedCount: 0
   // }
@@ -290,7 +290,7 @@ const fail = (message) => emitAlert("fail", message);
 const getEndpointConfig = (method, url) => {
   // endpoint config || global config
   const serviceEnvironmentId = serviceEnvironmentConfiguration?.serviceEnvironmentId;
-  const key = `${serviceEnvironmentId}:${method}:${url}`;
+  const key = `${method}:${url}`;
   const endpointConfig = rateLimitConfigMap?.[key];
   const conf = {
     ...endpointConfig,
@@ -303,7 +303,6 @@ const getEndpointConfig = (method, url) => {
 
 
 // fetch blockedIp at start with interval and pagination
-// 
 
 const isIpBlocked = (ip, serviceEnvironmentId) => {
   return new Promise((resolve) => {
@@ -333,7 +332,7 @@ const handleRateLimit = (req, res) => {
     return false
   }
 
-  const key = `${req?.headers[endpointConfig.ipKey]}:${endpointConfig.serviceEnvironmentId}:${req?.method}:${req?.url}`;
+  const key = `${req?.headers[endpointConfig.ipKey]}:${req?.method}:${req?.url}`;
   if (!rateLimitsCount[key]) {
     resetRateLimitsCount(key);
     return true
