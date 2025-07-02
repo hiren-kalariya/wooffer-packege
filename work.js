@@ -232,8 +232,30 @@ function init(token, serviceToken) {
         cpuUsageInterval: details.cpuUsageInterval || 10,
       }
       globalRateLimitConfig = { ...details.globalRateLimitConfig } || null;
-      // fetch this in loop wiht pag
-      rateLimitConfigMap = { ...details.rateLimitConfig } || null
+
+      let page = 1;
+      const limit = 10;
+      const fetchRateLimitConfigs = (page, limit) => {
+        const payload = { serviceEnvironmentId: serviceToken, page, limit };
+        socket.emit("requestRateLimitConfigs", payload);
+      };
+
+      socket.on("receiveRateLimitConfigs", (data) => {
+        rateLimitConfigMap = {
+          ...rateLimitConfigMap,
+          ...data.reduce((acc, config) => {
+            acc[`${config.method}:${config.endpoint}`] = config;
+            return acc;
+          }, {}),
+        };
+        console.log("::::: config receive in work", data);
+        if (data.length == limit) {
+          page++;
+          fetchRateLimitConfigs(page, limit);
+        }
+      });
+
+      fetchRateLimitConfigs(page, limit);
     });
 
     startMonitoring();
