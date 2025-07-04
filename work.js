@@ -40,6 +40,16 @@ let rateLimitsCount = {
   // }
 };
 
+let blockedIps = [];
+let newlyBlockedIps = [];
+let ipBlocked = {
+  // ip: {
+  //   endpoint: {
+  //     agent: failedAttemptCount
+  //   }
+  // }
+}
+
 const RecordData = (usageData = {}) => {
   if (
     !("CPU" in usageData) ||
@@ -114,7 +124,9 @@ function init(token, serviceToken) {
     clearInterval(IntervalID?.id);
     clearInterval(IntervalID?.usageIntervalIndex);
     delete IntervalID?.id;
+    clearInterval(IntervalID?.syncBlockedIpsIndex);
   };
+
   const startMonitoring = () => {
     const intervalIndex = setInterval(async () => {
       let usageData = {};
@@ -177,11 +189,23 @@ function init(token, serviceToken) {
       totalMemory = 0;
     }, (+serviceEnvironmentConfiguration?.cpuUsageInterval || 10) * 60 * 1000);
 
+    const syncBlockedIpsIndex = setInterval(() => {
+      if (newlyBlockedIps.length > 0) {
+        // post to db
+        socket.emit("syncNewlyBlockedIps", newlyBlockedIps);
+        newlyBlockedIps = [];
+      }
+      // TODO: change time
+    }, 20000);
+
     IntervalID = {
       id: intervalIndex,
       usageIntervalIndex,
+      syncBlockedIpsIndex,
     };
   };
+
+
   process.on("unhandledRejection", (reason, p) => {
     console.error(reason, "Unhandled Rejection at Promise", p);
     if (isConfigEnabled("isServerActivityLogEnabled")) {
@@ -233,29 +257,22 @@ function init(token, serviceToken) {
       }
       globalRateLimitConfig = { ...details.globalRateLimitConfig } || null;
 
-      let page = 1;
-      const limit = 10;
-      const fetchRateLimitConfigs = (page, limit) => {
-        const payload = { serviceEnvironmentId: serviceToken, page, limit };
-        socket.emit("requestRateLimitConfigs", payload);
-      };
-
       socket.on("receiveRateLimitConfigs", (data) => {
         rateLimitConfigMap = {
           ...rateLimitConfigMap,
-          ...data.reduce((acc, config) => {
-            acc[`${config.method}:${config.endpoint}`] = config;
-            return acc;
+          ...data.rows.reduce((a, c) => {
+            a[`${c.method}:${c.endpoint}`] = c;
+            return a;
           }, {}),
         };
-        console.log("::::: config receive in work", data);
-        if (data.length == limit) {
-          page++;
-          fetchRateLimitConfigs(page, limit);
-        }
       });
 
-      fetchRateLimitConfigs(page, limit);
+      socket.on("receiveBlockedIps", (data) => {
+        blockedIps = [ ...blockedIps, ...data.rows ];
+      })
+
+      socket.emit("requestRateLimitConfigs", { serviceEnvironmentId: serviceToken });
+      socket.emit("requestBlockedIps", { serviceEnvironmentId: serviceToken });
     });
 
     startMonitoring();
@@ -323,75 +340,95 @@ const getEndpointConfig = (method, url) => {
   return conf;
 };
 
-
-// fetch blockedIp at start with interval and pagination
-
-const isIpBlocked = (ip, serviceEnvironmentId) => {
-  return new Promise((resolve) => {
-    const handler = (isIpBlocked) => {
-      socket.off("isIpBlockedResponse", handler);
-      resolve(isIpBlocked);
-    };
-    socket.on("isIpBlockedResponse", handler);
-    socket.emit("checkIfIpIsBlocked", { ip, serviceEnvironmentId });
-  });
-};
+const isIpBlocked = (ip) => {
+  console.log("::::: Checking if IP is blocked:", ip);
+  // console.log("::::: Blocked IPs:", blockedIps);
+  // console.log("::::: Newly Blocked IPs:", newlyBlockedIps);
+  const isBlocked = [...blockedIps, ...newlyBlockedIps].some((ipBlocked) => ipBlocked.ip === ip);
+  console.log("::::: Is IP Blocked:", isBlocked);
+  return isBlocked;
+}
 
 const resetRateLimitsCount = (Key) => {
-  if (rateLimitsCount[Key]) {
-    rateLimitsCount[Key].timestamps = [Date.now()];
-    rateLimitsCount[Key].exceedCount = 0;
+  console.log("::::: Resetting rate limits count for key:", Key);
+  rateLimitsCount[Key].timestamps = [Date.now()];
+  rateLimitsCount[Key].exceedCount = 0;
+}
+
+const setRateLimitsCount = (Key) => {
+  console.log("::::: Resetting rate limits count for key:", Key);
+  rateLimitsCount[Key] = {
+    timestamps: [Date.now()],
+    exceedCount: 0
   }
 }
 
 const handleRateLimit = (req, res) => {
   const endpointConfig = getEndpointConfig(req.method, req.originalUrl);
+  console.log("::::: Endpoint Config:", endpointConfig);
   if (!endpointConfig || !endpointConfig.isRateLimit) return true;
 
   // check if ip is blocked
-  if (!isIpBlocked(req?.headers[endpointConfig.ipKey], endpointConfig.serviceEnvironmentId)) {
+  const ip = req?.headers[endpointConfig.ipKey];
+  console.log("::::: Checking if IP is blocked:", ip);
+  if (isIpBlocked(ip)) {
     res.status(403).send({ error: "Ip is blocked" });
-    return false
+    return false;
   }
 
-  const key = `${req?.headers[endpointConfig.ipKey]}:${req?.method}:${req?.url}`;
+  const key = `${ip}:${req?.method}:${req?.url}`;
+  console.log("::::: Rate Limit Key:", key);
   if (!rateLimitsCount[key]) {
-    resetRateLimitsCount(key);
-    return true
+    console.log("::::: No existing rate limit count, resetting.");
+    setRateLimitsCount(key);
+    console.log("::::: Rate limit counts", rateLimitsCount);
+    return true;
   }
 
   // check if the window is expired
-  if (Date.now() - rateLimitsCount[key].timestamps[0] >= endpointConfig.windowMs) {
-    // reset count with currentTime
+  const timeElapsed = Date.now() - rateLimitsCount[key].timestamps[0];
+  console.log("::::: Time elapsed since last request:", timeElapsed);
+  if (timeElapsed >= endpointConfig.windowMs) {
+    console.log("::::: Window expired, resetting count.");
     resetRateLimitsCount(key);
     return true;
   }
-  
+
   // check if limit is reached
-  if (rateLimitsCount[key].timestamps.length >= endpointConfig.maxRequests) {
+  const requestCount = rateLimitsCount[key].timestamps.length;
+  console.log("::::: Current request count:", requestCount);
+  if (requestCount >= endpointConfig.maxRequests) {
     // increment exceed count
     rateLimitsCount[key].exceedCount += 1;
-  
+    console.log("::::: Exceed count incremented:", rateLimitsCount[key].exceedCount);
+
     // if IP blocking limit is reached then block the IP
     if (endpointConfig?.isBlockAfterFault && rateLimitsCount[key].exceedCount >= endpointConfig.faultAllowLimit) {
-      socket.emit("blockIp", {
-        ip: req?.headers[endpointConfig.ipKey],
-        serviceEnvironmentId: endpointConfig.serviceEnvironmentId,
+      newlyBlockedIps.push({
+        serviceEnvironmentId: serviceEnvironmentConfiguration?.serviceEnvironmentId,
+        ip,
+        blockTime: new Date().toUTCString()
       });
+      console.log("::::: IP blocked due to exceeding fault limit:", ip);
+
       res.status(429).send({ message: `${endpointConfig.rateLimitExceedErrMsg}, Your IP has been blocked.` });
       return false;
     }
-  
-    // send response with custom message
+
+    console.log("::::: Rate limit exceeded, sending response.");
     res.status(429).send({ message: endpointConfig.rateLimitExceedErrMsg });
     return false;
   }
-  
-  resetRateLimitsCount(key);
+
+  console.log("::::: Request within limit, resetting count.");
+  // resetRateLimitsCount(key);
+  rateLimitsCount[key].timestamps.push(Date.now());
+  console.log("::::: Rate limit counts", rateLimitsCount);
   return true;
 }
 
 const requestMonitoring = (req, res, next) => {
+  console.log("::::: Request Monitoring");
   // TODO: does this goes inside or outside of the isConfigEnabled("isAPIEnabled")
   if (!handleRateLimit(req, res)) {
     console.log('handleRateLimit false');
