@@ -40,15 +40,18 @@ let rateLimitsCount = {
   // }
 };
 
-let blockedIps = new Set();
+let blockedIps = [];
 let newlyBlockedIps = [];
-let ipBlocked = {
-  // ip: {
-  //   endpoint: {
-  //     agent: failedAttemptCount
-  //   }
+let blockedIpAnalytics = [
+  // {
+  //   serviceEnvironmentId: string,
+  //   ip: string,
+  //   agent: string,
+  //   endpoint: string,
+  //   method: string,
+  //   exceedCount: number,
   // }
-}
+]
 
 const RecordData = (usageData = {}) => {
   if (
@@ -123,14 +126,15 @@ function init(token, serviceToken) {
   const stopMonitoring = () => {
     clearInterval(IntervalID?.id);
     clearInterval(IntervalID?.usageIntervalIndex);
-    delete IntervalID?.id;
     clearInterval(IntervalID?.syncBlockedIpsIndex);
     clearInterval(IntervalID?.autoReleaseBlockedIpsIndex);
+    IntervalID = {};
   };
 
   const startMonitoring = () => {
     if (IntervalID?.id) {
       clearInterval(IntervalID?.id);
+      delete IntervalID?.id;
     }
 
     const intervalIndex = setInterval(async () => {
@@ -174,16 +178,42 @@ function init(token, serviceToken) {
     IntervalID.id = intervalIndex;
   };
 
+  const filterBlockedIps = (autoReleaseAfter) => {
+    const ipsToUpdate = newlyBlockedIps.filter(ip =>
+      new Date(ip.blockTime).getTime() + autoReleaseAfter > Date.now()
+    );
+
+    const unblockedIps = blockedIps
+      .filter(ip => new Date(ip.blockTime).getTime() + autoReleaseAfter < Date.now())
+      .map(ip => ({
+        ...ip,
+        isBlocked: false,
+        blockTime: null,
+      }));
+
+    blockedIpAnalytics = blockedIpAnalytics.filter(ip =>
+      !unblockedIps.some(unblockedIp => unblockedIp.ip === ip.ip)
+    );
+
+    return {
+      updatedIps: [
+        ...ipsToUpdate,
+        ...unblockedIps
+      ],
+      blockedIpAnalytics
+    }
+  }
+
   const startConfigBasedMonitoring = () => {
-    if (IntervalID.usageIntervalIndex) {
-      clearInterval(IntervalID.usageIntervalIndex);
-    }
-    if (IntervalID.syncBlockedIpsIndex) {
-      clearInterval(IntervalID.syncBlockedIpsIndex);
-    }
-    if (IntervalID.autoReleaseBlockedIpsIndex) {
-      clearInterval(IntervalID.autoReleaseBlockedIpsIndex);
-    }
+    clearInterval(IntervalID?.usageIntervalIndex);
+    clearInterval(IntervalID?.syncBlockedIpsIndex);
+    clearInterval(IntervalID?.autoReleaseBlockedIpsIndex);
+    clearInterval(IntervalID?.dailySummaryIndex);
+
+    delete IntervalID?.usageIntervalIndex;
+    delete IntervalID?.syncBlockedIpsIndex;
+    delete IntervalID?.autoReleaseBlockedIpsIndex;
+    delete IntervalID?.dailySummaryIndex;
 
     const usageIntervalIndex = setInterval(async () => {
       if (isConfigEnabled("isProcessAndCPUUsageEnabled")) {
@@ -210,23 +240,30 @@ function init(token, serviceToken) {
 
     const blockDataSyncInterval = globalRateLimitConfig?.blockDataSyncInterval || 15 * 60 * 1000;
     const syncBlockedIpsIndex = setInterval(() => {
-      if (newlyBlockedIps.length > 0) {
-        socket.emit("syncNewlyBlockedIps", newlyBlockedIps);
-      }
+      const { updatedIps, blockedIpAnalytics } = filterBlockedIps(blockDataSyncInterval);
+      socket.emit("syncIpStatus", updatedIps);
+      socket.emit("syncBlockedIpAnalytics", blockedIpAnalytics);
     }, blockDataSyncInterval);
 
+    // auto release blocked ips
     const autoReleaseAfter = globalRateLimitConfig?.autoReleaseAfter || 15 * 60 * 1000;
     const autoReleaseBlockedIpsIndex = setInterval(() => {
-      newlyBlockedIps = newlyBlockedIps.filter(ip =>
-        new Date(ip.blockTime).getTime() + autoReleaseAfter > Date.now()
-      );
+      filterBlockedIps(autoReleaseAfter)
     }, autoReleaseAfter);
+
+    const dailySummaryIndex = setInterval(() => {
+      const now = new Date();
+      if (now.getHours() === 0 && now.getMinutes() === 0) {
+        socket.emit("requestGenerateBlockedIpDailySummary");
+      }
+    }, 60 * 1000);
 
     IntervalID = {
       ...IntervalID,
       usageIntervalIndex,
       syncBlockedIpsIndex,
       autoReleaseBlockedIpsIndex,
+      dailySummaryIndex,
     };
   };
 
@@ -268,7 +305,7 @@ function init(token, serviceToken) {
     }
   });
 
-  const updateRateLimitConfigs = () => {
+  const updateRateLimitConfigs = (newConfigs) => {
     rateLimitConfigMap = {
       ...rateLimitConfigMap,
       ...newConfigs.reduce((a, c) => {
@@ -279,11 +316,7 @@ function init(token, serviceToken) {
   }
 
   const updateBlockedIps = (newIps) => {
-    for (const ipObj of newIps) {
-      if (!blockedIps.has(ipObj.ip)) {
-        blockedIps.add(ipObj.ip)
-      }
-    }
+    blockedIps = [ ...blockedIps, ...newIps ]
   }
 
   const joinRoomEvent = () => {
@@ -291,7 +324,6 @@ function init(token, serviceToken) {
     socket.on("receiveBlockedIps", updateBlockedIps);
 
     socket.on("updateServiceEnvironmentInformationForPackage", (details) => {
-      console.log("::::: ~ socket.on ~ details:", details)
       serviceEnvironmentConfiguration = {
         serviceEnvironmentId: details.serviceToken || null,
         isAPIEnabled: details.isAPIEnabled || true,
@@ -387,18 +419,19 @@ const handleRateLimit = (req, res) => {
   }
 
   const key = `${ip}:${req?.method}:${req?.url}`;
+  const currentTime = Date.now();
   if (!rateLimitsCount[key]) {
     rateLimitsCount[key] = {
-      timestamps: [Date.now()],
+      timestamps: [currentTime],
       exceedCount: 0
     }
     return true;
   }
 
   // check if the window is expired
-  const timeElapsed = Date.now() - rateLimitsCount[key].timestamps[0];
+  const timeElapsed = currentTime - rateLimitsCount[key].timestamps[0];
   if (timeElapsed >= endpointConfig.windowMs) {
-    rateLimitsCount[key].timestamps = [Date.now()];
+    rateLimitsCount[key].timestamps = [currentTime];
     rateLimitsCount[key].exceedCount = 0;
     return true;
   }
@@ -414,7 +447,16 @@ const handleRateLimit = (req, res) => {
         serviceEnvironmentId: serviceEnvironmentConfiguration?.serviceEnvironmentId,
         ip,
         isBlocked: true,
-        blockTime: new Date().toUTCString()
+        blockTime: new Date(currentTime).toISOString()
+      });
+
+      blockedIpAnalytics.push({
+        serviceEnvironmentId: serviceEnvironmentConfiguration?.serviceEnvironmentId,
+        ip,
+        agent: req?.headers["user-agent"],
+        endpoint: req?.originalUrl,
+        method: req?.method,
+        exceedCount: rateLimitsCount[key].exceedCount,
       });
 
       res.status(429).send({ message: endpointConfig?.blockIpMsg });
@@ -425,13 +467,13 @@ const handleRateLimit = (req, res) => {
     return false;
   }
 
-  rateLimitsCount[key].timestamps.push(Date.now());
+  rateLimitsCount[key].timestamps.push(currentTime);
   return true;
 }
 
 const requestMonitoring = (req, res, next) => {
   if (!handleRateLimit(req, res)) return;
-  
+
   if (isConfigEnabled("isAPIEnabled")) {
     // request monitoring
     const requestReceivedTime = new Date();
