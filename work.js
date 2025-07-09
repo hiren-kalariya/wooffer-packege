@@ -450,14 +450,25 @@ const handleRateLimit = (req, res) => {
         blockTime: new Date(currentTime).toISOString()
       });
 
-      blockedIpAnalytics.push({
-        serviceEnvironmentId: serviceEnvironmentConfiguration?.serviceEnvironmentId,
-        ip,
-        agent: req?.headers["user-agent"],
-        endpoint: req?.originalUrl,
-        method: req?.method,
-        exceedCount: rateLimitsCount[key].exceedCount,
-      });
+      const existingAnalytics = blockedIpAnalytics.find(item =>
+        item.serviceEnvironmentId === serviceEnvironmentConfiguration?.serviceEnvironmentId &&
+        item.ip === ip &&
+        item.agent === req?.headers["user-agent"] &&
+        item.endpoint === req?.originalUrl &&
+        item.method === req?.method
+      );
+      if (existingAnalytics) {
+        existingAnalytics.exceedCount = rateLimitsCount[key].exceedCount;
+      } else {
+        blockedIpAnalytics.push({
+          serviceEnvironmentId: serviceEnvironmentConfiguration?.serviceEnvironmentId,
+          ip,
+          agent: req?.headers["user-agent"],
+          endpoint: req?.originalUrl,
+          method: req?.method,
+          exceedCount: rateLimitsCount[key].exceedCount,
+        });
+      }
 
       res.status(429).send({ message: endpointConfig?.blockIpMsg });
       return false;
