@@ -240,9 +240,10 @@ function init(token, serviceToken) {
 
     const blockDataSyncInterval = globalRateLimitConfig?.blockDataSyncInterval || 15 * 60 * 1000;
     const syncBlockedIpsIndex = setInterval(() => {
-      const { updatedIps, blockedIpAnalytics } = filterBlockedIps(blockDataSyncInterval);
-      socket.emit("syncIpStatus", updatedIps);
-      socket.emit("syncBlockedIpAnalytics", blockedIpAnalytics);
+      const { updatedIps, blockedIpAnalytics: analytics } = filterBlockedIps(blockDataSyncInterval);
+      socket.emit("syncIpStatus", { ips: updatedIps, analytics });
+      newlyBlockedIps = [];
+      blockedIpAnalytics = [];
     }, blockDataSyncInterval);
 
     // auto release blocked ips
@@ -316,7 +317,12 @@ function init(token, serviceToken) {
   }
 
   const updateBlockedIps = (newIps) => {
-    blockedIps = [ ...blockedIps, ...newIps ]
+    const map = new Map();
+    [...blockedIps, ...newIps].forEach(ipObj => {
+      const key = ipObj.id || ipObj.ip;
+      if (key) map.set(key, ipObj);
+    });
+    blockedIps = Array.from(map.values());
   }
 
   const joinRoomEvent = () => {
@@ -458,7 +464,7 @@ const handleRateLimit = (req, res) => {
         item.method === req?.method
       );
       if (existingAnalytics) {
-        existingAnalytics.exceedCount = rateLimitsCount[key].exceedCount;
+        existingAnalytics.exceedCount = existingAnalytics.exceedCount + rateLimitsCount[key].exceedCount;
       } else {
         blockedIpAnalytics.push({
           serviceEnvironmentId: serviceEnvironmentConfiguration?.serviceEnvironmentId,
