@@ -252,13 +252,6 @@ function init(token, serviceToken) {
       filterBlockedIps(autoReleaseAfter)
     }, autoReleaseAfter);
 
-    const dailySummaryIndex = setInterval(() => {
-      const now = new Date();
-      if (now.getHours() === 0 && now.getMinutes() === 0) {
-        socket.emit("requestGenerateBlockedIpDailySummary");
-      }
-    }, 60 * 1000);
-
     IntervalID = {
       ...IntervalID,
       usageIntervalIndex,
