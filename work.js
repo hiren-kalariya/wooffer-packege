@@ -26,31 +26,14 @@ let disConnectTime = new Date().toUTCString();
 const socket = io("https://dev-socket.wooffer.io/");
 
 let serviceEnvironmentConfiguration = {};
-let rateLimitConfigMap = {
-  // "<Method>:<url>": config
-}
+let rateLimitConfigMap = {}
 let globalRateLimitConfig = {}
 
-let rateLimitsCount = {
-  // remove service env id
-  // "<ip>:<Method>:<url>": {
-  //   timestamps: [Date.now()]
-  //   exceedCount: 0
-  // }
-};
+let rateLimitsCount = {};
 
 let blockedIps = [];
 let newlyBlockedIps = [];
-let blockedIpAnalytics = [
-  // {
-  //   serviceEnvironmentId: string,
-  //   ip: string,
-  //   agent: string,
-  //   endpoint: string,
-  //   method: string,
-  //   exceedCount: number,
-  // }
-]
+let blockedIpAnalytics = []
 
 const RecordData = (usageData = {}) => {
   if (
