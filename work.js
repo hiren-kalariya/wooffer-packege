@@ -23,9 +23,34 @@ let maxProcessMemoryUsage = 0;
 
 let disConnectTime = new Date().toUTCString();
 
-const socket = io("https://staging-socket.wooffer.io");
+// const socket = io("https://staging-socket.wooffer.io");
+const socket = io("http://localhost:5500");
 
 let serviceEnvironmentConfiguration = {};
+let rateLimitConfigMap = {
+  // "<Method>:<url>": config
+}
+let globalRateLimitConfig = {}
+
+let rateLimitsCount = {
+  // remove service env id
+  // "<ip>:<Method>:<url>": {
+  //   timestamps: [Date.now()]
+  //   exceedCount: 0
+  // }
+};
+
+let blockedIpList = []
+let latestBlockedIpList = []
+let ipData = {}
+
+const apiServices = axios.create({
+  baseURL: 'http://localhost:3001/api/v1',
+  headers: {
+    Accept: "application/json",
+    "api-key": 'djfufhtette353535&%fdgdg5%fhfh%%fhfh%&&fffhfhhhh&&&ihfndfs',
+  },
+});
 
 const RecordData = (usageData = {}) => {
   if (
@@ -95,6 +120,59 @@ const isConfigEnabled = (configKey) => {
     serviceEnvironmentConfiguration[configKey]
   );
 };
+
+const formatData = (data) => {
+  return data?.rows?.reduce((a, c) => {
+    a[`${c?.method}:${c.endpoint}`] = c;
+    return a
+  }, {})
+}
+
+const fetchLimitedData = (serviceEnvironmentId, page, limit) => {
+  apiServices.get(`socket/rateLimitConfig?serviceEnvironmentId=${serviceEnvironmentId}&page=${page}&limit=${limit}`)
+    .then((res) => {
+      const { data } = res?.data
+      const formattedData = formatData(data)
+      rateLimitConfigMap = { ...rateLimitConfigMap, ...formattedData }
+      if (page * limit <= data?.count) {
+        page++;
+        fetchLimitedData(serviceEnvironmentId, page, limit);
+      }
+    })
+    .catch((err) => {
+      console.log("Error in fetching rate limit config", err)
+    })
+}
+
+const fetchBlockedIPs = (serviceEnvironmentId, page, limit) => {
+  apiServices.get(`socket/ip?serviceEnvironmentId=${serviceEnvironmentId}&isBlocked=true&page=${page}&limit=${limit}`)
+    .then((res) => {
+      const { data } = res?.data
+      blockedIpList = [ ...blockedIpList, ...data.rows ]
+      if (page * limit <= data?.count) {
+        page++;
+        fetchBlockedIPs(serviceEnvironmentId, page, limit);
+      }
+    })
+    .catch((err) => {
+      console.log("Error in fetching rate limit config", err)
+    })
+}
+
+const getRateLimitConfig = (serviceEnvironmentId) => {
+  let page = 1;
+  // TODO: change this to a realistic number
+  let limit = 6
+  fetchLimitedData(serviceEnvironmentId, page, limit)
+}
+
+const getBlockedIpList = (serviceEnvironmentId) => {
+  // console.log('fetchBlockedIpList')
+  let page = 1;
+  // TODO: change this to a realistic number
+  let limit = 4;
+  fetchBlockedIPs(serviceEnvironmentId, page, limit)
+}
 
 function init(token, serviceToken) {
   const stopMonitoring = () => {
@@ -169,6 +247,7 @@ function init(token, serviceToken) {
       usageIntervalIndex,
     };
   };
+
   process.on("unhandledRejection", (reason, p) => {
     console.error(reason, "Unhandled Rejection at Promise", p);
     if (isConfigEnabled("isServerActivityLogEnabled")) {
@@ -209,20 +288,18 @@ function init(token, serviceToken) {
 
   const joinRoomEvent = () => {
     socket.on("updateServiceEnvironmentInformationForPackage", (details) => {
-      const {
-        isAPIEnabled = true,
-        isServerActivityLogEnabled = true,
-        isProcessAndCPUUsageEnabled = true,
-        cpuUsageInterval = 10,
-        isCustomLogEnabled = true,
-      } = details;
+      console.log("::::: ~ socket.on ~ details:", details)
       serviceEnvironmentConfiguration = {
-        isAPIEnabled,
-        isServerActivityLogEnabled,
-        isCustomLogEnabled,
-        isProcessAndCPUUsageEnabled,
-        cpuUsageInterval,
-      };
+        serviceEnvironmentId: details.serviceToken || null,
+        isAPIEnabled: details.isAPIEnabled || true,
+        isServerActivityLogEnabled: details.isServerActivityLogEnabled || true,
+        isCustomLogEnabled: details.isCustomLogEnabled || true,
+        isProcessAndCPUUsageEnabled: details.isProcessAndCPUUsageEnabled || true,
+        cpuUsageInterval: details.cpuUsageInterval || 10,
+      }
+      globalRateLimitConfig = { ...details.globalRateLimitConfig } || null;
+      getRateLimitConfig(serviceToken);
+      getBlockedIpList(serviceToken);
     });
 
     startMonitoring();
@@ -266,34 +343,95 @@ function init(token, serviceToken) {
   });
 }
 
-const alert = (message = " ") => {
+const emitAlert = (type, message = " ") => {
   if (isConfigEnabled("isCustomLogEnabled")) {
-    socket.emit("alert", {
-      type: "alert",
-      message,
-    });
-  }
-};
-const success = (message = " ") => {
-  if (isConfigEnabled("isCustomLogEnabled")) {
-    socket.emit("alert", {
-      type: "success",
-      message,
-    });
+    socket.emit("alert", { type, message });
   }
 };
 
-const fail = (message = " ") => {
-  if (isConfigEnabled("isCustomLogEnabled")) {
-    socket.emit("alert", {
-      type: "fail",
-      message,
-    });
-  }
+const alert = (message) => emitAlert("alert", message);
+const success = (message) => emitAlert("success", message);
+const fail = (message) => emitAlert("fail", message);
+
+const getEndpointConfig = (method, url) => {
+  // endpoint config || global config
+  const serviceEnvironmentId = serviceEnvironmentConfiguration?.serviceEnvironmentId;
+  const key = `${method}:${url}`;
+  const endpointConfig = rateLimitConfigMap?.[key];
+  const conf = {
+    ...endpointConfig,
+    isRateLimit: globalRateLimitConfig.isRateLimit,
+    serviceEnvironmentId,
+    ipKey: endpointConfig?.ipKey || globalRateLimitConfig.ipKey
+  } || globalRateLimitConfig;
+  return conf;
 };
+
+const isIpBlocked = (ip) => blockedIpList.some((blockedIp) => blockedIp.ip === ip);
+
+const resetRateLimitsCount = (Key) => {
+  if (rateLimitsCount[Key]) {
+    rateLimitsCount[Key].timestamps = [Date.now()];
+    rateLimitsCount[Key].exceedCount = 0;
+  }
+}
+
+const handleRateLimit = (req, res) => {
+  const endpointConfig = getEndpointConfig(req.method, req.originalUrl);
+  if (!endpointConfig || !endpointConfig.isRateLimit) return true;
+
+  // check if ip is blocked
+  if (!isIpBlocked(req?.headers[endpointConfig.ipKey])) {
+    res.status(403).send({ error: "Ip is blocked" });
+    return false
+  }
+
+  const key = `${req?.headers[endpointConfig.ipKey]}:${req?.method}:${req?.url}`;
+  if (!rateLimitsCount[key]) {
+    resetRateLimitsCount(key);
+    return true
+  }
+
+  // check if the window is expired
+  if (Date.now() - rateLimitsCount[key].timestamps[0] >= endpointConfig.windowMs) {
+    // reset count with currentTime
+    resetRateLimitsCount(key);
+    return true;
+  }
+
+  // check if limit is reached
+  if (rateLimitsCount[key].timestamps.length >= endpointConfig.maxRequests) {
+    // increment exceed count
+    rateLimitsCount[key].exceedCount += 1;
+    let ipDetails = ipData[req?.method][req?.url][req?.headers['user-agent']];
+    ipDetails.failedAttempts = ipDetails.failedAttempts ? ipDetails.failedAttempts + 1 : 0;
+
+    // if IP blocking limit is reached then block the IP
+    if (endpointConfig?.isBlockAfterFault && rateLimitsCount[key].exceedCount >= endpointConfig.faultAllowLimit) {
+      latestBlockedIpList.push({
+        ip: req?.headers[endpointConfig.ipKey],
+      })
+      res.status(429).send({ message: `${endpointConfig.rateLimitExceedErrMsg}, Your IP has been blocked.` });
+      return false;
+    }
+
+    // send response with custom message
+    res.status(429).send({ message: endpointConfig.rateLimitExceedErrMsg });
+    return false;
+  }
+
+  resetRateLimitsCount(key);
+  return true;
+}
 
 const requestMonitoring = (req, res, next) => {
+  // TODO: does this goes inside or outside of the isConfigEnabled("isAPIEnabled")
+  if (!handleRateLimit(req, res)) {
+    return
+  };
+  
   if (isConfigEnabled("isAPIEnabled")) {
+    // request monitoring
     const requestReceivedTime = new Date();
     socket.emit("requestStart", {
       method: req.method,
