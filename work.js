@@ -23,9 +23,34 @@ let maxProcessMemoryUsage = 0;
 
 let disConnectTime = new Date().toUTCString();
 
-const socket = io("https://staging-socket.wooffer.io");
+const socket = io("https://dev-socket.wooffer.io/");
 
 let serviceEnvironmentConfiguration = {};
+let rateLimitConfigMap = {
+  // "<Method>:<url>": config
+}
+let globalRateLimitConfig = {}
+
+let rateLimitsCount = {
+  // remove service env id
+  // "<ip>:<Method>:<url>": {
+  //   timestamps: [Date.now()]
+  //   exceedCount: 0
+  // }
+};
+
+let blockedIps = [];
+let newlyBlockedIps = [];
+let blockedIpAnalytics = [
+  // {
+  //   serviceEnvironmentId: string,
+  //   ip: string,
+  //   agent: string,
+  //   endpoint: string,
+  //   method: string,
+  //   exceedCount: number,
+  // }
+]
 
 const RecordData = (usageData = {}) => {
   if (
@@ -100,9 +125,17 @@ function init(token, serviceToken) {
   const stopMonitoring = () => {
     clearInterval(IntervalID?.id);
     clearInterval(IntervalID?.usageIntervalIndex);
-    delete IntervalID?.id;
+    clearInterval(IntervalID?.syncBlockedIpsIndex);
+    clearInterval(IntervalID?.autoReleaseBlockedIpsIndex);
+    IntervalID = {};
   };
+
   const startMonitoring = () => {
+    if (IntervalID?.id) {
+      clearInterval(IntervalID?.id);
+      delete IntervalID?.id;
+    }
+
     const intervalIndex = setInterval(async () => {
       let usageData = {};
 
@@ -141,6 +174,46 @@ function init(token, serviceToken) {
       }
     }, 2500);
 
+    IntervalID.id = intervalIndex;
+  };
+
+  const filterBlockedIps = (autoReleaseAfter) => {
+    const ipsToUpdate = newlyBlockedIps.filter(ip =>
+      new Date(ip.blockTime).getTime() + autoReleaseAfter > Date.now()
+    );
+
+    const unblockedIps = blockedIps
+      .filter(ip => new Date(ip.blockTime).getTime() + autoReleaseAfter < Date.now())
+      .map(ip => ({
+        ...ip,
+        isBlocked: false,
+        blockTime: null,
+      }));
+
+    blockedIpAnalytics = blockedIpAnalytics.filter(ip =>
+      !unblockedIps.some(unblockedIp => unblockedIp.ip === ip.ip)
+    );
+
+    return {
+      updatedIps: [
+        ...ipsToUpdate,
+        ...unblockedIps
+      ],
+      blockedIpAnalytics
+    }
+  }
+
+  const startConfigBasedMonitoring = () => {
+    clearInterval(IntervalID?.usageIntervalIndex);
+    clearInterval(IntervalID?.syncBlockedIpsIndex);
+    clearInterval(IntervalID?.autoReleaseBlockedIpsIndex);
+    clearInterval(IntervalID?.dailySummaryIndex);
+
+    delete IntervalID?.usageIntervalIndex;
+    delete IntervalID?.syncBlockedIpsIndex;
+    delete IntervalID?.autoReleaseBlockedIpsIndex;
+    delete IntervalID?.dailySummaryIndex;
+
     const usageIntervalIndex = setInterval(async () => {
       if (isConfigEnabled("isProcessAndCPUUsageEnabled")) {
         socket.emit("updateUsage", {
@@ -164,11 +237,29 @@ function init(token, serviceToken) {
       totalMemory = 0;
     }, (+serviceEnvironmentConfiguration?.cpuUsageInterval || 10) * 60 * 1000);
 
+    const blockDataSyncInterval = globalRateLimitConfig?.blockDataSyncInterval || 15 * 60 * 1000;
+    const syncBlockedIpsIndex = setInterval(() => {
+      const { updatedIps, blockedIpAnalytics: analytics } = filterBlockedIps(blockDataSyncInterval);
+      socket.emit("syncIpStatus", { ips: updatedIps, analytics });
+      newlyBlockedIps = [];
+      blockedIpAnalytics = [];
+    }, blockDataSyncInterval);
+
+    // auto release blocked ips
+    const autoReleaseAfter = globalRateLimitConfig?.autoReleaseAfter || 15 * 60 * 1000;
+    const autoReleaseBlockedIpsIndex = setInterval(() => {
+      filterBlockedIps(autoReleaseAfter)
+    }, autoReleaseAfter);
+
     IntervalID = {
-      id: intervalIndex,
+      ...IntervalID,
       usageIntervalIndex,
+      syncBlockedIpsIndex,
+      autoReleaseBlockedIpsIndex,
+      dailySummaryIndex,
     };
   };
+
   process.on("unhandledRejection", (reason, p) => {
     console.error(reason, "Unhandled Rejection at Promise", p);
     if (isConfigEnabled("isServerActivityLogEnabled")) {
@@ -207,22 +298,43 @@ function init(token, serviceToken) {
     }
   });
 
+  const updateRateLimitConfigs = (newConfigs) => {
+    rateLimitConfigMap = {
+      ...rateLimitConfigMap,
+      ...newConfigs.reduce((a, c) => {
+        a[`${c.method}:${c.endpoint}`] = c;
+        return a;
+      }, {}),
+    };
+  }
+
+  const updateBlockedIps = (newIps) => {
+    const map = new Map();
+    [...blockedIps, ...newIps].forEach(ipObj => {
+      const key = ipObj.id || ipObj.ip;
+      if (key) map.set(key, ipObj);
+    });
+    blockedIps = Array.from(map.values());
+  }
+
   const joinRoomEvent = () => {
+    socket.on("receiveRateLimitConfigs", updateRateLimitConfigs);
+    socket.on("receiveBlockedIps", updateBlockedIps);
+
     socket.on("updateServiceEnvironmentInformationForPackage", (details) => {
-      const {
-        isAPIEnabled = true,
-        isServerActivityLogEnabled = true,
-        isProcessAndCPUUsageEnabled = true,
-        cpuUsageInterval = 10,
-        isCustomLogEnabled = true,
-      } = details;
       serviceEnvironmentConfiguration = {
-        isAPIEnabled,
-        isServerActivityLogEnabled,
-        isCustomLogEnabled,
-        isProcessAndCPUUsageEnabled,
-        cpuUsageInterval,
-      };
+        serviceEnvironmentId: details.serviceToken || null,
+        isAPIEnabled: details.isAPIEnabled || true,
+        isServerActivityLogEnabled: details.isServerActivityLogEnabled || true,
+        isCustomLogEnabled: details.isCustomLogEnabled || true,
+        isProcessAndCPUUsageEnabled: details.isProcessAndCPUUsageEnabled || true,
+        cpuUsageInterval: details.cpuUsageInterval || 10,
+      }
+      globalRateLimitConfig = { ...details.globalRateLimitConfig } || null;
+      startConfigBasedMonitoring();
+
+      socket.emit("requestRateLimitConfigs", { serviceEnvironmentId: serviceToken });
+      socket.emit("requestBlockedIps", { serviceEnvironmentId: serviceToken });
     });
 
     startMonitoring();
@@ -266,34 +378,113 @@ function init(token, serviceToken) {
   });
 }
 
-const alert = (message = " ") => {
+const emitAlert = (type, message = " ") => {
   if (isConfigEnabled("isCustomLogEnabled")) {
-    socket.emit("alert", {
-      type: "alert",
-      message,
-    });
-  }
-};
-const success = (message = " ") => {
-  if (isConfigEnabled("isCustomLogEnabled")) {
-    socket.emit("alert", {
-      type: "success",
-      message,
-    });
+    socket.emit("alert", { type, message });
   }
 };
 
-const fail = (message = " ") => {
-  if (isConfigEnabled("isCustomLogEnabled")) {
-    socket.emit("alert", {
-      type: "fail",
-      message,
-    });
-  }
+const alert = (message) => emitAlert("alert", message);
+const success = (message) => emitAlert("success", message);
+const fail = (message) => emitAlert("fail", message);
+
+const getEndpointConfig = (method, url) => {
+  const serviceEnvironmentId = serviceEnvironmentConfiguration?.serviceEnvironmentId;
+  const key = `${method}:${url}`;
+  const endpointConfig = rateLimitConfigMap?.[key];
+  const conf = {
+    ...endpointConfig,
+    isRateLimit: globalRateLimitConfig.isRateLimit,
+    serviceEnvironmentId,
+    ipKey: endpointConfig?.ipKey || globalRateLimitConfig.ipKey,
+  } || globalRateLimitConfig;
+  return conf;
 };
+
+const isIpBlocked = (ip) => {
+  const check = (i) => i.ip === ip;
+  return blockedIps.some(check) || newlyBlockedIps.some(check);
+}
+
+const handleRateLimit = (req, res) => {
+  const endpointConfig = getEndpointConfig(req.method, req.originalUrl);
+  if (!endpointConfig || !endpointConfig.isRateLimit) return true;
+
+  const ip = req?.headers[endpointConfig.ipKey];
+  if (isIpBlocked(ip)) {
+    res.status(403).send({ error: "Ip is blocked" });
+    return false;
+  }
+
+  const key = `${ip}:${req?.method}:${req?.url}`;
+  const currentTime = Date.now();
+  if (!rateLimitsCount[key]) {
+    rateLimitsCount[key] = {
+      timestamps: [currentTime],
+      exceedCount: 0
+    }
+    return true;
+  }
+
+  // check if the window is expired
+  const timeElapsed = currentTime - rateLimitsCount[key].timestamps[0];
+  if (timeElapsed >= endpointConfig.windowMs) {
+    rateLimitsCount[key].timestamps = [currentTime];
+    rateLimitsCount[key].exceedCount = 0;
+    return true;
+  }
+
+  // check if limit is reached
+  const requestCount = rateLimitsCount[key].timestamps.length;
+  if (requestCount >= endpointConfig.maxRequests) {
+    rateLimitsCount[key].exceedCount += 1;
+
+    // if IP blocking limit is reached then block the IP
+    if (endpointConfig?.isBlockAfterFault && rateLimitsCount[key].exceedCount >= endpointConfig.faultAllowLimit) {
+      newlyBlockedIps.push({
+        serviceEnvironmentId: serviceEnvironmentConfiguration?.serviceEnvironmentId,
+        ip,
+        isBlocked: true,
+        blockTime: new Date(currentTime).toISOString()
+      });
+
+      const existingAnalytics = blockedIpAnalytics.find(item =>
+        item.serviceEnvironmentId === serviceEnvironmentConfiguration?.serviceEnvironmentId &&
+        item.ip === ip &&
+        item.agent === req?.headers["user-agent"] &&
+        item.endpoint === req?.originalUrl &&
+        item.method === req?.method
+      );
+      if (existingAnalytics) {
+        existingAnalytics.exceedCount = existingAnalytics.exceedCount + rateLimitsCount[key].exceedCount;
+      } else {
+        blockedIpAnalytics.push({
+          serviceEnvironmentId: serviceEnvironmentConfiguration?.serviceEnvironmentId,
+          ip,
+          agent: req?.headers["user-agent"],
+          endpoint: req?.originalUrl,
+          method: req?.method,
+          exceedCount: rateLimitsCount[key].exceedCount,
+        });
+      }
+
+      res.status(429).send({ message: endpointConfig?.blockIpMsg });
+      return false;
+    }
+
+    res.status(429).send({ message: endpointConfig.rateLimitExceedErrMsg });
+    return false;
+  }
+
+  rateLimitsCount[key].timestamps.push(currentTime);
+  return true;
+}
 
 const requestMonitoring = (req, res, next) => {
+  if (!handleRateLimit(req, res)) return;
+
   if (isConfigEnabled("isAPIEnabled")) {
+    // request monitoring
     const requestReceivedTime = new Date();
     socket.emit("requestStart", {
       method: req.method,
