@@ -190,12 +190,10 @@ function init(token, serviceToken) {
     clearInterval(IntervalID?.usageIntervalIndex);
     clearInterval(IntervalID?.syncBlockedIpsIndex);
     clearInterval(IntervalID?.autoReleaseBlockedIpsIndex);
-    clearInterval(IntervalID?.dailySummaryIndex);
 
     delete IntervalID?.usageIntervalIndex;
     delete IntervalID?.syncBlockedIpsIndex;
     delete IntervalID?.autoReleaseBlockedIpsIndex;
-    delete IntervalID?.dailySummaryIndex;
 
     const usageIntervalIndex = setInterval(async () => {
       if (isConfigEnabled("isProcessAndCPUUsageEnabled")) {
@@ -239,7 +237,6 @@ function init(token, serviceToken) {
       usageIntervalIndex,
       syncBlockedIpsIndex,
       autoReleaseBlockedIpsIndex,
-      dailySummaryIndex,
     };
   };
 
