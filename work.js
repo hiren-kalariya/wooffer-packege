@@ -372,12 +372,12 @@ const getEndpointConfig = (method, url) => {
   const serviceEnvironmentId = serviceEnvironmentConfiguration?.serviceEnvironmentId;
   const key = `${method}:${url}`;
   const endpointConfig = rateLimitConfigMap?.[key];
-  const conf = {
+  const conf = endpointConfig ? {
     ...endpointConfig,
     isRateLimit: globalRateLimitConfig.isRateLimit,
     serviceEnvironmentId,
     ipKey: endpointConfig?.ipKey || globalRateLimitConfig.ipKey,
-  } || globalRateLimitConfig;
+  } : globalRateLimitConfig;
   return conf;
 };
 
@@ -386,17 +386,55 @@ const isIpBlocked = (ip) => {
   return blockedIps.some(check) || newlyBlockedIps.some(check);
 }
 
+const blockIp = (ip, currentTime, req, key) => {
+  newlyBlockedIps.push({
+    serviceEnvironmentId: serviceEnvironmentConfiguration?.serviceEnvironmentId,
+    ip,
+    isBlocked: true,
+    blockTime: new Date(currentTime).toISOString()
+  });
+
+  const existingAnalytics = blockedIpAnalytics.find(item =>
+    item.serviceEnvironmentId === serviceEnvironmentConfiguration?.serviceEnvironmentId &&
+    item.ip === ip &&
+    item.agent === req?.headers["user-agent"] &&
+    item.endpoint === req?.originalUrl &&
+    item.method === req?.method
+  );
+
+  if (existingAnalytics) {
+    existingAnalytics.exceedCount = existingAnalytics.exceedCount + rateLimitsCount[key].exceedCount;
+  } else {
+    blockedIpAnalytics.push({
+      serviceEnvironmentId: serviceEnvironmentConfiguration?.serviceEnvironmentId,
+      ip,
+      agent: req?.headers["user-agent"],
+      endpoint: req?.originalUrl,
+      method: req?.method,
+      exceedCount: rateLimitsCount[key].exceedCount,
+    });
+  }
+}
+
 const handleRateLimit = (req, res) => {
   const endpointConfig = getEndpointConfig(req.method, req.originalUrl);
   if (!endpointConfig || !endpointConfig.isRateLimit) return true;
 
   const ip = req?.headers[endpointConfig.ipKey];
-  if (isIpBlocked(ip)) {
-    res.status(403).send({ error: "Ip is blocked" });
+  const key = `${ip}:${req?.method}:${req?.url}`;
+
+  // should block if no key found
+  if (!ip && endpointConfig.shouldBlockIfNoKeyFound) {
+    blockIp(ip, Date.now(), req, key);
+    res.status(403).send({ error: "IP is blocked due to no key found" });
     return false;
   }
 
-  const key = `${ip}:${req?.method}:${req?.url}`;
+  if (isIpBlocked(ip)) {
+    res.status(403).send({ error: endpointConfig.blockIpMsg });
+    return false;
+  }
+
   const currentTime = Date.now();
   if (!rateLimitsCount[key]) {
     rateLimitsCount[key] = {
@@ -421,33 +459,7 @@ const handleRateLimit = (req, res) => {
 
     // if IP blocking limit is reached then block the IP
     if (endpointConfig?.isBlockAfterFault && rateLimitsCount[key].exceedCount >= endpointConfig.faultAllowLimit) {
-      newlyBlockedIps.push({
-        serviceEnvironmentId: serviceEnvironmentConfiguration?.serviceEnvironmentId,
-        ip,
-        isBlocked: true,
-        blockTime: new Date(currentTime).toISOString()
-      });
-
-      const existingAnalytics = blockedIpAnalytics.find(item =>
-        item.serviceEnvironmentId === serviceEnvironmentConfiguration?.serviceEnvironmentId &&
-        item.ip === ip &&
-        item.agent === req?.headers["user-agent"] &&
-        item.endpoint === req?.originalUrl &&
-        item.method === req?.method
-      );
-      if (existingAnalytics) {
-        existingAnalytics.exceedCount = existingAnalytics.exceedCount + rateLimitsCount[key].exceedCount;
-      } else {
-        blockedIpAnalytics.push({
-          serviceEnvironmentId: serviceEnvironmentConfiguration?.serviceEnvironmentId,
-          ip,
-          agent: req?.headers["user-agent"],
-          endpoint: req?.originalUrl,
-          method: req?.method,
-          exceedCount: rateLimitsCount[key].exceedCount,
-        });
-      }
-
+      blockIp(ip, Date.now(), req, key);
       res.status(429).send({ message: endpointConfig?.blockIpMsg });
       return false;
     }
