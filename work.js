@@ -23,7 +23,7 @@ let maxProcessMemoryUsage = 0;
 
 let disConnectTime = new Date().toUTCString();
 
-const socket = io("https://dev-socket.wooffer.io/");
+const socket = io("https://staging-socket.wooffer.io/");
 
 let serviceEnvironmentConfiguration = {};
 let rateLimitConfigMap = {}
