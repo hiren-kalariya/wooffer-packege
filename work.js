@@ -35,6 +35,9 @@ let blockedIps = [];
 let newlyBlockedIps = [];
 let blockedIpAnalytics = []
 
+const SLACK_DEBOUNCE_TIME = 30 * 1000;
+const slackErrors = {}
+
 const RecordData = (usageData = {}) => {
   if (
     !("CPU" in usageData) ||
@@ -240,42 +243,24 @@ function init(token, serviceToken) {
     };
   };
 
-  process.on("unhandledRejection", (reason, p) => {
-    console.error(reason, "Unhandled Rejection at Promise", p);
+  const handleError = (e = {}) => {
     if (isConfigEnabled("isServerActivityLogEnabled")) {
-      if (reason?.name !== null && reason?.name !== undefined) {
-        socket.emit(
-          "error",
-          "Name : " +
-            reason?.name +
-            "\nMessage : " +
-            reason?.message +
-            "\nstack : " +
-            reason?.stack
-        );
-      } else {
-        socket.emit("error", reason.toString());
-      }
+      const errorMessage = e?.name !== null && e?.name !== undefined
+        ? `Name : ${e?.name}\nMessage : ${e?.message}\nstack : ${e?.stack}`
+        : e?.toString();
+      const key = `${e?.name}:${e?.message}`;
+      emitAlert(key, "error", errorMessage);
+    } else {
     }
+  }
+
+  process.on("unhandledRejection", (reason, p) => {
+    console.error(reason, "Unhandled Rejection at Promise", p);    handleError(reason);
   });
 
   process.on("uncaughtException", (err) => {
     console.log(err);
-    if (isConfigEnabled("isServerActivityLogEnabled")) {
-      if (err?.name !== null && err?.name !== undefined) {
-        socket.emit(
-          "error",
-          "Name : " +
-            err.name +
-            "\nMessage : " +
-            err.message +
-            "\nstack : " +
-            err.stack
-        );
-      } else {
-        socket.emit("error", err.toString());
-      }
-    }
+    handleError(err);
   });
 
   const updateRateLimitConfigs = (newConfigs) => {
@@ -358,15 +343,38 @@ function init(token, serviceToken) {
   });
 }
 
-const emitAlert = (type, message = " ") => {
+const sendToSlack = (type, message) => {
   if (isConfigEnabled("isCustomLogEnabled")) {
     socket.emit("alert", { type, message });
   }
+}
+
+const handleSlackMessage = (key, type, message) => {
+  return setTimeout(() => {
+    if (slackErrors[key] && slackErrors[key].count > 1) {
+      sendToSlack(type, `[${slackErrors[key].count} times]: ${message}`);
+    }
+    delete slackErrors[key];
+  }, SLACK_DEBOUNCE_TIME)
+}
+
+const emitAlert = (key, type, message = " ") => {
+  if (!slackErrors[key]) {
+    slackErrors[key] = {
+      count: 1,
+      timeout: handleSlackMessage(key, type, message)
+    };
+    sendToSlack(type, message);
+  } else {
+    slackErrors[key].count++;
+    clearTimeout(slackErrors[key].timeout);
+    slackErrors[key].timeout = handleSlackMessage(key, type, message);
+  }
 };
 
-const alert = (message) => emitAlert("alert", message);
-const success = (message) => emitAlert("success", message);
-const fail = (message) => emitAlert("fail", message);
+const alert = (message) => emitAlert(`alert:${message}`, "alert", message);
+const success = (message) => emitAlert(`success:${message}`, "success", message);
+const fail = (message) => emitAlert(`fail:${message}`, "fail", message);
 
 const getEndpointConfig = (method, url) => {
   const serviceEnvironmentId = serviceEnvironmentConfiguration?.serviceEnvironmentId;
