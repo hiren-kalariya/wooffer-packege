@@ -23,6 +23,10 @@ let maxProcessMemoryUsage = 0;
 
 let disConnectTime = new Date().toUTCString();
 
+let requestBatchData = {};
+let batchInterval = 15 * 60 * 1000;
+let batchIntervalId = null;
+
 const socket = io("https://staging-socket.wooffer.io/");
 
 let serviceEnvironmentConfiguration = {};
@@ -113,6 +117,7 @@ function init(token, serviceToken) {
     clearInterval(IntervalID?.usageIntervalIndex);
     clearInterval(IntervalID?.syncBlockedIpsIndex);
     clearInterval(IntervalID?.autoReleaseBlockedIpsIndex);
+    stopBatchProcessing();
     IntervalID = {};
   };
 
@@ -244,14 +249,12 @@ function init(token, serviceToken) {
   };
 
   const handleError = (e = {}) => {
-    if (isConfigEnabled("isServerActivityLogEnabled")) {
-      const errorMessage = e?.name !== null && e?.name !== undefined
-        ? `Name : ${e?.name}\nMessage : ${e?.message}\nstack : ${e?.stack}`
-        : e?.toString();
-      const key = `${e?.name}:${e?.message}`;
-      emitAlert(key, "error", errorMessage);
-    } else {
-    }
+    if (!isConfigEnabled("isServerActivityLogEnabled")) return;
+
+    const errorMessage = e?.name !== null && e?.name !== undefined
+      ? `Name : ${e?.name}\nMessage : ${e?.message}\nstack : ${e?.stack}`
+      : e?.toString();
+    emitAlert(`${e?.name}:${e?.message}`, "error", errorMessage);
   }
 
   process.on("unhandledRejection", (reason, p) => {
@@ -294,9 +297,11 @@ function init(token, serviceToken) {
         isCustomLogEnabled: details.isCustomLogEnabled || true,
         isProcessAndCPUUsageEnabled: details.isProcessAndCPUUsageEnabled || true,
         cpuUsageInterval: details.cpuUsageInterval || 10,
+        allAllowedAPI: details.allAllowedAPI || [],
       }
       globalRateLimitConfig = { ...details.globalRateLimitConfig } || null;
       startConfigBasedMonitoring();
+      startBatchProcessing();
 
       socket.emit("requestRateLimitConfigs", { serviceEnvironmentId: serviceToken });
       socket.emit("requestBlockedIps", { serviceEnvironmentId: serviceToken });
@@ -326,6 +331,7 @@ function init(token, serviceToken) {
   socket.on("connect", joinRoomEvent); // Join the room when connected initially
   socket.on("disconnect", () => {
     disConnectTime = new Date().toUTCString();
+    processBatch();
     stopMonitoring();
   }); // Join the room when connected initially
 
@@ -370,6 +376,150 @@ const emitAlert = (key, type, message = " ") => {
     clearTimeout(slackErrors[key].timeout);
     slackErrors[key].timeout = handleSlackMessage(key, type, message);
   }
+};
+
+/**
+ * Checks if the input string starts with any of the provided prefixes.
+ *
+ * @param {string} input - The string to check.
+ * @param {string[]} prefixes - Array of prefix strings.
+ * @param {string} type - The type of request ("Internal" or "ThirdParty").
+ * @returns {boolean} True if input matches the condition, otherwise false.
+ */
+const startsWithAny = (input, prefixes, type) => {
+  if (prefixes && prefixes.length === 0) return true
+  if (!prefixes || !Array.isArray(prefixes)) return false
+  if (type === "ThirdParty") return true
+  if (prefixes.some(prefix => input.startsWith(prefix))) return true
+  return false;
+};
+
+/**
+ * Adds a request entry to the batch for monitoring and analytics.
+ *
+ * @param {string} method - HTTP method of the request.
+ * @param {string} originalUrl - The original URL of the request.
+ * @param {string} [type="Internal"] - The type of request ("Internal" or "ThirdParty"), defaults to "Internal".
+ */
+const addRequestToBatch = (method, originalUrl, type = "Internal") => {
+  if (!isConfigEnabled("isAPIEnabled")) return;
+  if (originalUrl && originalUrl.length > 250) return;
+
+  const serviceEnvironmentId = serviceEnvironmentConfiguration?.serviceEnvironmentId;
+  if (!serviceEnvironmentId) return;
+
+  const allowedAPIs = serviceEnvironmentConfiguration?.allAllowedAPI || [];
+  const condition = startsWithAny(originalUrl, allowedAPIs, type);
+  if (!condition) return;
+  
+  const key = `${serviceEnvironmentId}_${method}_${originalUrl}`;
+  if (requestBatchData[key]) {
+    requestBatchData[key].count += 1;
+    requestBatchData[key].failCount += 1;
+  } else {
+    requestBatchData[key] = {
+      successCount: 0,
+      failCount: 1,
+      avgResponseTime: 0.0,
+      type: type,
+      count: 1,
+      method: method,
+      endPoint: originalUrl,
+      serviceEnvironmentId: serviceEnvironmentId,
+    };
+  }
+};
+
+/**
+ * Updates the request batch data with the response information.
+ *
+ * @param {string} method - HTTP method of the request.
+ * @param {string} originalUrl - The original URL of the request.
+ * @param {number} timeDifference - The response time in milliseconds.
+ * @param {number} responseStatus - The HTTP response status code.
+ * @param {string} [type="Internal"] - The type of request ("Internal" or "ThirdParty"), defaults to "Internal".
+ */
+const updateRequestBatchResponse = (method, originalUrl, timeDifference, responseStatus, type = "Internal") => {
+  if (!isConfigEnabled("isAPIEnabled")) return;
+  
+  const serviceToken = serviceEnvironmentConfiguration?.serviceEnvironmentId;
+  if (!serviceToken) return;
+
+  const allowedAPIs = serviceEnvironmentConfiguration?.allAllowedAPI || [];
+  const condition = startsWithAny(originalUrl, allowedAPIs, type);
+  if (!condition) return;
+
+  const key = `${serviceToken}_${method}_${originalUrl}`;
+  if (requestBatchData[key]) {
+    if (responseStatus <= 299) {
+      requestBatchData[key].successCount += 1;
+      requestBatchData[key].failCount -= 1;
+    }
+    requestBatchData[key].avgResponseTime += timeDifference;
+  } else {
+    requestBatchData[key] = {
+      successCount: 0,
+      failCount: 1,
+      avgResponseTime: 0.0,
+      count: 1,
+      method: method,
+      type: type,
+      endPoint: originalUrl,
+      serviceEnvironmentId: serviceToken,
+    };
+  }
+};
+
+const processBatch = () => {
+  if (!Object.keys(requestBatchData).length) return;
+
+  const payload = Object.values(requestBatchData).map((request) => {
+    const successCount = +request?.successCount || 0;
+    const failCount = +request?.failCount || 0;
+    let avgResponseTime = 0;
+
+    if (successCount + failCount > 0) {
+      avgResponseTime = request?.avgResponseTime / (successCount + failCount);
+    }
+
+    const count = request?.count || 0;
+    const method = request?.method || "";
+    const endPoint = request?.endPoint || "";
+    const serviceEnvironmentId = request?.serviceEnvironmentId || 0;
+
+    return {
+      successCount,
+      failCount,
+      avgResponseTime,
+      count,
+      method,
+      endPoint,
+      serviceEnvironmentId,
+      type: request?.type || "Internal",
+    };
+  });
+
+  if (!payload.length) return 
+
+  try {
+    socket.emit("requestBatch", payload);
+  } catch (error) {
+    console.error("Error emitting requestBatch:", error);
+  } finally {
+    requestBatchData = {};
+  }
+};
+
+const startBatchProcessing = () => {
+  if (batchIntervalId) clearInterval(batchIntervalId);
+  batchIntervalId = setInterval(processBatch, batchInterval);
+};
+
+const stopBatchProcessing = () => {
+  if (!batchIntervalId) return
+
+  clearInterval(batchIntervalId);
+  batchIntervalId = null;
 };
 
 const alert = (message) => emitAlert(`alert:${message}`, "alert", message);
@@ -486,27 +636,15 @@ const requestMonitoring = (req, res, next) => {
   if (isConfigEnabled("isAPIEnabled")) {
     // request monitoring
     const requestReceivedTime = new Date();
-    socket.emit("requestStart", {
-      method: req.method,
-      originalUrl: req.originalUrl,
-      requestReceivedTime: requestReceivedTime.toUTCString(),
-    });
+    addRequestToBatch(req.method, req.originalUrl, "Internal");
 
     // Continue to the next middleware or route handler
     res.on("finish", () => {
       const responseSentTime = new Date();
       const timeDifference = responseSentTime - requestReceivedTime;
-
-      // Check the response status
       const responseStatus = res.statusCode;
 
-      socket.emit("responseSent", {
-        method: req.method,
-        originalUrl: req.originalUrl,
-        requestReceivedTime: requestReceivedTime.toUTCString(),
-        timeDifference,
-        responseStatus,
-      });
+      updateRequestBatchResponse(req.method, req.originalUrl, timeDifference, responseStatus, "Internal");
     });
   }
   next();
@@ -515,15 +653,9 @@ const requestMonitoring = (req, res, next) => {
 // Add a request interceptor
 axios.interceptors.request.use(
   (config) => {
-    const startTime = new Date();
     config.metadata = {startTime: new Date()};
     if (isConfigEnabled("isAPIEnabled")) {
-      socket.emit("requestStart", {
-        method: config.method,
-        type: "ThirdParty",
-        originalUrl: config.url,
-        requestReceivedTime: startTime.toUTCString(),
-      });
+      addRequestToBatch(config.method, config.url, "ThirdParty");
     }
     return config;
   },
@@ -531,15 +663,13 @@ axios.interceptors.request.use(
     const endTime = new Date();
     const timeDifference = endTime - error.config.metadata.startTime;
     if (isConfigEnabled("isAPIEnabled")) {
-      socket.emit("responseSent", {
-        method: error.config.method,
-        originalUrl: error.config.url,
-        requestReceivedTime: error.config.metadata.startTime,
+      updateRequestBatchResponse(
+        error?.config?.method,
+        error?.config?.url,
         timeDifference,
-        responseStatus: error.response ? error.response.status : "No response",
-        errorMessage: error.message,
-        type: "ThirdParty",
-      });
+        error?.response ? error?.response?.status : "No response",
+        "ThirdParty"
+      );
     }
     return Promise.reject(error);
   }
@@ -551,14 +681,13 @@ axios.interceptors.response.use(
     const endTime = new Date();
     const timeDifference = endTime - response.config.metadata.startTime;
     if (isConfigEnabled("isAPIEnabled")) {
-      socket.emit("responseSent", {
-        method: response.config.method,
-        originalUrl: response.config.url,
-        requestReceivedTime: response.config.metadata.startTime,
+      updateRequestBatchResponse(
+        response?.config?.method,
+        response?.config?.url,
         timeDifference,
-        type: "ThirdParty",
-        responseStatus: response.status,
-      });
+        error?.response ? error?.response?.status : "No response",
+        "ThirdParty"
+      );
     }
 
     return response;
@@ -567,15 +696,13 @@ axios.interceptors.response.use(
     const endTime = new Date();
     const timeDifference = endTime - error.config.metadata.startTime;
     if (isConfigEnabled("isAPIEnabled")) {
-      socket.emit("responseSent", {
-        method: error.config.method,
-        originalUrl: error.config.url,
-        requestReceivedTime: error.config.metadata.startTime,
+      updateRequestBatchResponse(
+        error?.config?.method,
+        error?.config?.url,
         timeDifference,
-        type: "ThirdParty",
-        responseStatus: error.response ? error.response.status : "No response",
-        errorMessage: error.message,
-      });
+        error?.response ? error?.response?.status : "No response",
+        "ThirdParty"
+      );
     }
     return Promise.reject(error);
   }
